@@ -1,0 +1,22 @@
+{
+  "name": "get-youtube-transcript-with-headless-browser-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for getting transcript/subtitles from youtube videos using a headless browser (Playwright)",
+  "type": "module",
+  "main": "main.js",
+  "bin": {
+    "get-youtube-transcript-with-headless-browser-mcp": "main.js"
+  },
+  "scripts": {
+    "postinstall": "playwright install chromium",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["mcp", "youtube", "playwright", "headless", "browser", "transcript", "subtitle", "video"],
+  "author": "Mizstik",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "playwright": "^1.49.0",
+    "zod": "^3.25.76"
+  }
+}
