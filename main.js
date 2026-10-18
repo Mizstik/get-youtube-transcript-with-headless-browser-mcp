@@ -337,34 +337,74 @@ async function scrapeTranscript(page) {
 }
 
 // ── MCP server ───────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: config.name,
-  version: config.version,
-})
+// The SDK forbids connecting one McpServer instance to a second transport, so
+// HTTP mode creates a fresh server + transport per request (stateless mode).
+// Tools are stateless: they share the module-level browser queue, cache, config.
+function createServer() {
+  const server = new McpServer({
+    name: config.name,
+    version: config.version,
+  })
 
-server.registerTool(
-  "get-youtube-video-transcript-and-title",
-  {
-    title: "Get Youtube Video Transcript and Title",
-    description: `Get transcript with timestamps and title from a youtube video using a headless browser. In stdio mode, responses longer than ${Math.round(CHUNK_SIZE / 1024)} KB are split into chunks. If the response starts with '--- Part 1/', call this tool again with chunk=2, chunk=3, etc. to get the remaining parts.`,
-    inputSchema: {
-      video_id: z.string().regex(YOUTUBE_VIDEO_ID_REGEX, "Invalid YouTube video ID format"),
-      lang: z.string().regex(VALID_LANG_CODES, "Invalid language code format"),
-      chunk: z.number().int().min(1).optional().default(1)
+  server.registerTool(
+    "get-youtube-video-transcript-and-title",
+    {
+      title: "Get Youtube Video Transcript and Title",
+      description: `Get transcript with timestamps and title from a youtube video using a headless browser. In stdio mode, responses longer than ${Math.round(CHUNK_SIZE / 1024)} KB are split into chunks. If the response starts with '--- Part 1/', call this tool again with chunk=2, chunk=3, etc. to get the remaining parts.`,
+      inputSchema: {
+        video_id: z.string().regex(YOUTUBE_VIDEO_ID_REGEX, "Invalid YouTube video ID format"),
+        lang: z.string().regex(VALID_LANG_CODES, "Invalid language code format"),
+        chunk: z.number().int().min(1).optional().default(1)
+      }
+    },
+    async ({video_id, lang, chunk}) => {
+      if (mode === 'stdio') {
+        return await handle_chunked_subtitle(video_id, lang, chunk)
+      }
+      return {
+        content: [{
+          type: "text",
+          text: await fetch_subtitle(video_id, lang)
+        }]
+      }
     }
-  },
-  async ({video_id, lang, chunk}) => {
-    if (mode === 'stdio') {
-      return await handle_chunked_subtitle(video_id, lang, chunk)
-    }
-    return {
+  )
+
+  server.registerTool(
+    "get-youtube-video-comments",
+    {
+      title: "Get Youtube Video Comments",
+      description: "Get comments from a youtube video using a headless browser",
+      inputSchema: {
+        video_id: z.string().regex(YOUTUBE_VIDEO_ID_REGEX, "Invalid YouTube video ID format"),
+        sortby: z.enum(VALID_SORT_OPTIONS, "sortby must be 'top' or 'newest'"),
+        max_comments: z.number().int().min(1).max(1000, "max_comments must not exceed 1000")
+      }
+    },
+    async ({video_id, sortby, max_comments}) => ({
       content: [{
         type: "text",
-        text: await fetch_subtitle(video_id, lang)
+        text: await fetch_comments(video_id, sortby, max_comments)
       }]
-    }
-  }
-)
+    })
+  )
+
+  server.registerTool(
+    "login-youtube-browser",
+    {
+      title: "Login to YouTube in Browser",
+      description: "Open a visible browser window with the MCP's persistent profile so the user can sign in to YouTube once. The session is saved and used to defeat bot checks in subsequent headless fetches. Blocks until the user closes the browser window.",
+    },
+    async () => ({
+      content: [{
+        type: "text",
+        text: await login_youtube()
+      }]
+    })
+  )
+
+  return server
+}
 
 async function handle_chunked_subtitle(video_id, lang, chunk) {
   await ensureCacheDir()
@@ -434,25 +474,6 @@ async function fetch_subtitle(video_id, lang = "en") {
     }
   })
 }
-
-server.registerTool(
-  "get-youtube-video-comments",
-  {
-    title: "Get Youtube Video Comments",
-    description: "Get comments from a youtube video using a headless browser",
-    inputSchema: {
-      video_id: z.string().regex(YOUTUBE_VIDEO_ID_REGEX, "Invalid YouTube video ID format"),
-      sortby: z.enum(VALID_SORT_OPTIONS, "sortby must be 'top' or 'newest'"),
-      max_comments: z.number().int().min(1).max(1000, "max_comments must not exceed 1000")
-    }
-  },
-  async ({video_id, sortby, max_comments}) => ({
-    content: [{
-      type: "text",
-      text: await fetch_comments(video_id, sortby, max_comments)
-    }]
-  })
-)
 
 async function fetch_comments(video_id, sortby = "top", max_comments = 30) {
   return serialize(async () => {
@@ -559,20 +580,6 @@ async function fetch_comments(video_id, sortby = "top", max_comments = 30) {
   })
 }
 
-server.registerTool(
-  "login-youtube-browser",
-  {
-    title: "Login to YouTube in Browser",
-    description: "Open a visible browser window with the MCP's persistent profile so the user can sign in to YouTube once. The session is saved and used to defeat bot checks in subsequent headless fetches. Blocks until the user closes the browser window.",
-  },
-  async () => ({
-    content: [{
-      type: "text",
-      text: await login_youtube()
-    }]
-  })
-)
-
 async function login_youtube() {
   return serialize(async () => {
     try {
@@ -594,8 +601,9 @@ async function login_youtube() {
 // ── Stdio transport ──────────────────────────────────────────────────────────
 async function serve_stdio() {
   await cleanCache()
+  const server = createServer()
   const transport = new StdioServerTransport()
-  server.connect(transport)
+  await server.connect(transport)
 }
 
 // ── HTTP transport ───────────────────────────────────────────────────────────
@@ -628,13 +636,18 @@ function serve_http(port) {
         }
         return originalEnd(chunk, ...args)
       }
-      // Stateless mode: the SDK requires a fresh transport per request
+      // Stateless mode: the SDK requires a fresh server + transport per request,
+      // so concurrent requests never touch the same Protocol instance.
+      const server = createServer()
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       })
+      res.on('close', () => {
+        transport.close().catch(() => {})
+        server.close().catch(() => {})
+      })
       await server.connect(transport)
-      res.on('close', () => { transport.close().catch(() => {}) })
       await transport.handleRequest(req, res, parsedBody)
     } else {
       console.log(`${timestamp} ${req.method} ${req.url}`)
