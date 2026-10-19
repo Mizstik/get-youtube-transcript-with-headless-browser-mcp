@@ -1,2 +1,3 @@
 .browser-profile
 node_modules
+.cache

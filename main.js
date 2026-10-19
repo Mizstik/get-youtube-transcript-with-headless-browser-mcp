@@ -18,6 +18,7 @@ const config = {
   chunkSizeBytes: 15000,      // max bytes per stdio chunk (~15 KB)
   cacheTtlMs: 10 * 60 * 1000, // 10 minutes
   navTimeoutMs: 45000,        // page navigation timeout
+  buttonTimeoutMs: 10000,     // "Show transcript" chip presence timeout (it is SSR'd)
   panelTimeoutMs: 20000,      // transcript panel load timeout
 }
 
@@ -277,43 +278,44 @@ async function checkBotCheck(page) {
   return null
 }
 
-// Port of the bookmarklet: direct DOM click on the "Show transcript" chip
-// (Playwright's actionability-checked click times out because the chip sits
-// inside the collapsed description), then scrape the panel's DOM.
-async function scrapeTranscript(page) {
-  // The chip is rendered by the JS app after hydration — wait for it to exist
-  await page.waitForFunction(() =>
-    document.querySelector('[aria-label="Show transcript"]') ||
-    document.querySelector('ytd-video-description-transcript-section-renderer button'),
-    null,
-    { timeout: config.panelTimeoutMs }
-  ).catch(() => {})
+// ── Transcript scraping ──────────────────────────────────────────────────────
+// Port of the proven bookmarklet approach, hardened against YouTube's
+// hydration timing and A/B layout variants.
 
-  const clicked = await page.evaluate(() => {
-    const el = document.querySelector('[aria-label="Show transcript"]') ||
-      document.querySelector('ytd-video-description-transcript-section-renderer button')
+const TRANSCRIPT_BUTTON_SELECTOR =
+  '[aria-label="Show transcript"], ytd-video-description-transcript-section-renderer button'
+
+// Any known markup generation of an open transcript panel
+const TRANSCRIPT_PANEL_SELECTOR =
+  'transcript-segment-view-model, .ytwTranscriptSegmentViewModelTimestamp, ytd-transcript-segment-renderer'
+
+async function transcriptPanelOpen(page) {
+  return page.evaluate(sel => document.querySelector(sel) !== null, TRANSCRIPT_PANEL_SELECTOR)
+    .catch(() => false)
+}
+
+// Click the "Show transcript" chip. Prefer Playwright's trusted mouse click
+// (isTrusted=true); fall back to a synthetic DOM click (what the bookmarklet does).
+async function clickTranscriptButton(page) {
+  const loc = page.locator(TRANSCRIPT_BUTTON_SELECTOR).first()
+  try {
+    if (await loc.count()) {
+      await loc.click({ timeout: 3000 })
+      return true
+    }
+  } catch (_) { /* not actionable — fall through to synthetic click */ }
+
+  return page.evaluate(sel => {
+    const el = document.querySelector(sel)
     if (!el) return false
     el.click()
     return true
-  })
-  if (!clicked) {
-    return { title: null, segments: [], error: "Transcript button not found. The video may have no captions, or the page layout is unexpected." }
-  }
+  }, TRANSCRIPT_BUTTON_SELECTOR)
+}
 
-  // Wait for the panel to render segments (new view model or classic renderer)
-  await page.waitForSelector(
-    'transcript-segment-view-model, ytd-transcript-segment-renderer',
-    { timeout: config.panelTimeoutMs }
-  )
-
+// Extract segments from the open panel (new view model or classic renderer)
+async function collectSegments(page) {
   return page.evaluate(() => {
-    const titleEl = document.querySelector('h1 yt-formatted-string') ||
-      document.querySelector('h1.style-scope.ytd-watch-metadata') ||
-      document.querySelector('h1')
-    const title = (titleEl ? titleEl.textContent : document.title)
-      .replace(/\n/g, ' ').replace(/\s+/g, ' ').trim()
-      .replace(/ - YouTube$/, '')
-
     const segments = []
 
     // Newer transcript view model (as used by the bookmarklet)
@@ -332,8 +334,109 @@ async function scrapeTranscript(page) {
       })
     }
 
-    return { title, segments }
-  })
+    return segments
+  }).catch(() => [])
+}
+
+// Last resort: mimic the proven bookmarklet — read the whole panel text and
+// parse "timestamp + text" pairs with a regex. Robust to markup renames.
+async function fallbackScrape(page) {
+  return page.evaluate(() => {
+    const candidates = [
+      document.querySelector('engagement-panel'),
+      document.querySelector('#secondary-inner')?.firstChild,
+      document.querySelector('#secondary-inner'),
+    ].filter(Boolean)
+
+    const tsRe = /\b(\d{1,2}:\d{2}(?::\d{2})?)\s+/g
+    let best = []
+
+    for (const container of candidates) {
+      const text = (container.textContent || '').replace(/\n/g, ' ').replace(/\s+/g, ' ')
+      tsRe.lastIndex = 0
+      const matches = []
+      let m
+      while ((m = tsRe.exec(text)) !== null) {
+        matches.push({ ts: m[1], start: m.index, bodyStart: m.index + m[0].length })
+      }
+      if (matches.length < 2) continue // too few timestamps to be the transcript
+
+      const segments = []
+      for (let i = 0; i < matches.length; i++) {
+        const end = i + 1 < matches.length ? matches[i + 1].start : text.length
+        const body = text.slice(matches[i].bodyStart, end).trim()
+        if (body) segments.push([matches[i].ts, body])
+      }
+      if (segments.length > best.length) best = segments
+    }
+
+    return best
+  }).catch(() => [])
+}
+
+async function scrapeTranscript(page, mark = () => {}) {
+  // The chip is rendered by the JS app after hydration — wait for it to exist
+  await page.waitForFunction(sel => document.querySelector(sel) !== null, TRANSCRIPT_BUTTON_SELECTOR, {
+    timeout: config.buttonTimeoutMs
+  }).catch(() => {})
+  mark('transcript button present')
+
+  // Let the app finish fetching its JS bundles and hydrate before clicking —
+  // a click on an unhydrated button is a silent no-op (the bookmarklet works
+  // because a human runs it seconds after load). 'load' = all synchronous
+  // resources fetched; a flat 2s wait covers the final hydration tick.
+  await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {})
+  mark('bundles loaded')
+  mark('waiting 2s for hydration')
+  await page.waitForTimeout(2000)
+
+  // Click → verify → retry: the first click can still land before event
+  // handlers are attached, so re-click until the panel actually renders.
+  let opened = false
+  for (let attempt = 1; attempt <= 5 && !opened; attempt++) {
+    mark(`click attempt ${attempt}`)
+    const clicked = await clickTranscriptButton(page)
+    if (!clicked) break
+
+    const deadline = Date.now() + 4000
+    while (Date.now() < deadline) {
+      opened = await transcriptPanelOpen(page)
+      if (opened) break
+      await page.waitForTimeout(400)
+    }
+    if (opened) mark('panel open')
+  }
+
+  if (!opened) {
+    return { title: null, segments: [], error: "Transcript button not found or the panel did not open. The video may have no captions, or the page layout is unexpected." }
+  }
+
+  // Wait until at least one segment (timestamp + text) is extractable — the
+  // panel can mount before its data finishes loading.
+  let segments = []
+  const deadline = Date.now() + config.panelTimeoutMs
+  while (Date.now() < deadline && segments.length === 0) {
+    segments = await collectSegments(page)
+    if (segments.length === 0) await page.waitForTimeout(500)
+  }
+  mark(`segments collected: ${segments.length}`)
+
+  // Last resort: scrape the whole panel text like the bookmarklet does
+  if (segments.length === 0) {
+    segments = await fallbackScrape(page)
+    mark(`fallback scrape: ${segments.length} segments`)
+  }
+
+  const title = await page.evaluate(() => {
+    const titleEl = document.querySelector('h1 yt-formatted-string') ||
+      document.querySelector('h1.style-scope.ytd-watch-metadata') ||
+      document.querySelector('h1')
+    return (titleEl ? titleEl.textContent : document.title)
+      .replace(/\n/g, ' ').replace(/\s+/g, ' ').trim()
+      .replace(/ - YouTube$/, '')
+  }).catch(() => null)
+
+  return { title, segments }
 }
 
 // ── MCP server ───────────────────────────────────────────────────────────────
@@ -450,24 +553,31 @@ async function handle_chunked_subtitle(video_id, lang, chunk) {
 
 async function fetch_subtitle(video_id, lang = "en") {
   return serialize(async () => {
+    const t0 = Date.now()
+    // stderr is safe in both stdio and HTTP modes (stdout carries the protocol)
+    const mark = (label) => console.error(`[trace] +${((Date.now() - t0) / 1000).toFixed(1)}s ${label}`)
     let page
     try {
       const context = await getContext(true)
+      mark('browser ready')
       page = await newPage(context)
 
       await page.goto(watchUrl(video_id, lang), { waitUntil: 'domcontentloaded' })
+      mark('DOM-ready')
       await dismissConsent(page)
 
       const botCheck = await checkBotCheck(page)
       if (botCheck) return botCheck
 
-      const { title, segments, error } = await scrapeTranscript(page)
+      const { title, segments, error } = await scrapeTranscript(page, mark)
       if (error) return "Error fetching subtitle: " + error
       if (!segments || segments.length === 0) return "No transcript available."
 
+      mark(`done (${segments.length} segments)`)
       const timestampedText = segmentsToTimestampedText(segments)
       return `title: ${title}\n\n${timestampedText}`
     } catch (err) {
+      mark('ERROR ' + (err.message || String(err)))
       return "Error fetching subtitle: " + (err.message || 'Unknown error occurred')
     } finally {
       if (page) { try { await page.close() } catch (_) {} }
